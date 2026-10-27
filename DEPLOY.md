@@ -1,84 +1,95 @@
-# Deploy da GymRats API no VPS
+# Deploy da GymRats API no VPS (Docker + Caddy)
 
 Arquitetura:
 
 ```
-  sync.py (timer 60min)  ──►  gymrats.db (SQLite)  ──►  api.py (FastAPI/uvicorn)  ──►  nginx+HTTPS  ──►  seu app React
-     puxa do GymRats                                      :8000 (so localhost)         :443
+  gr-api-sync (loop 60min)  ──►  data/gymrats.db (SQLite)  ──►  gr-api (FastAPI)  ──►  Caddy+HTTPS  ──►  seu app React
+     puxa do GymRats                                              :8000 na rede "web"     :443
 ```
 
-- **Ingestão:** `sync.py` roda a cada 60 min (systemd timer), puxa do GymRats e grava no SQLite.
-- **API:** `api.py` (FastAPI) serve o SQLite como REST, com API key e CORS.
-- **nginx:** reverse proxy + HTTPS; só ele fica exposto. A API escuta só em `127.0.0.1`.
+Dois containers da mesma imagem, compartilhando `./data` (bind mount):
+
+- **`gr-api-sync`:** roda `sync.py`, dorme 1h, repete. Grava no SQLite.
+- **`gr-api`:** FastAPI servindo o SQLite como REST, com API key e CORS. Está na
+  rede externa `web` e **não publica porta**: só o Caddy alcança.
+- **Caddy** (já existente na VPS): reverse proxy + HTTPS automático.
+
+Os dois rodam como uid 1000 dentro do container.
 
 ---
 
-## 1. Servidor (Ubuntu/Debian)
+## 1. DNS
+
+Crie um registro **A** `gr-api.<seu domínio>` apontando para o IP da VPS. Faça
+isso primeiro: o Caddy só consegue o certificado depois que o DNS propaga.
+
+## 2. Código + segredos
+
+Tudo sem abrir editor. Não sobrescreve o que já existir no `.env`.
 
 ```bash
-sudo adduser --system --group gymrats
-sudo mkdir -p /opt/gymrats && sudo chown gymrats:gymrats /opt/gymrats
-sudo apt update && sudo apt install -y python3-venv nginx
+cd ~ && git clone https://github.com/iranbatista/gr-api.git && cd gr-api
+touch .env && chmod 600 .env
+grep -q '^GYMRATS_API_KEY=' .env || echo "GYMRATS_API_KEY=$(openssl rand -hex 32)" >> .env
+grep -q '^GYMRATS_CORS=' .env    || echo "GYMRATS_CORS=https://seuapp.com" >> .env   # troque pelo domínio do React
+# cole o JWT (não aparece na tela) e dê Enter:
+read -rsp "Token GymRats: " T && echo "GYMRATS_TOKEN=$T" >> .env; unset T; echo
+cat .env    # confira as três linhas
 ```
 
-Copie para `/opt/gymrats`: `api.py`, `sync.py`, `requirements.txt`, `requirements-api.txt`.
+- `GYMRATS_TOKEN`: o JWT extraído do app (ver README). A renovação continua sendo
+  feita na sua máquina via emulador (ver final deste arquivo).
+- `GYMRATS_API_KEY`: a chave que o React manda no header `X-API-Key`.
+- `GYMRATS_CORS`: o(s) domínio(s) do app React, separados por vírgula.
+
+## 3. Subir
 
 ```bash
-cd /opt/gymrats
-python3 -m venv venv
-./venv/bin/pip install -r requirements.txt -r requirements-api.txt
+mkdir -p data && sudo chown 1000:1000 data     # os containers rodam como uid 1000
+docker compose up -d --build
+docker compose ps                              # gr-api (healthy) e gr-api-sync (Up)
+docker compose logs -f gr-api-sync             # acompanhe o 1º sync; Ctrl+C sai do log
 ```
 
-## 2. Configuração (.env)
+Até o primeiro sync terminar, o `/health` responde 503 (banco ainda sem tabelas)
+e o `gr-api` aparece como `unhealthy`. Isso se resolve sozinho.
+
+## 4. Caddy
+
+Adicione o bloco do `Caddyfile.example` (com seu domínio) no `~/caddy/Caddyfile`.
+Sem editor de terminal:
 
 ```bash
-cp .env.example .env && nano .env     # preencha GYMRATS_TOKEN, GYMRATS_API_KEY, GYMRATS_CORS, GYMRATS_DB
-chmod 600 .env
+cp ~/caddy/Caddyfile ~/caddy/Caddyfile.bak     # backup
+printf '\ngr-api.SEUDOMINIO {\n\treverse_proxy gr-api:8000\n}\n' >> ~/caddy/Caddyfile   # troque SEUDOMINIO
+docker exec caddy caddy validate --config /etc/caddy/Caddyfile
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile
 ```
 
-- `GYMRATS_TOKEN` — o JWT extraído do app (ver README; renovação continua sendo feita na sua máquina via emulador).
-- `GYMRATS_API_KEY` — gere uma chave longa: `openssl rand -hex 32`.
-- `GYMRATS_CORS` — o(s) domínio(s) do seu app React.
-- `GYMRATS_DB=/opt/gymrats/gymrats.db`.
+Se o `validate` reclamar, volte o backup: `cp ~/caddy/Caddyfile.bak ~/caddy/Caddyfile`.
 
-## 3. Primeira carga
+## 5. Testar
 
 ```bash
-cd /opt/gymrats && set -a && . ./.env && set +a && ./venv/bin/python sync.py
+curl https://gr-api.SEUDOMINIO/health
+curl -H "X-API-Key: SUA_CHAVE" https://gr-api.SEUDOMINIO/challenges
 ```
+Docs interativas (Swagger): `https://gr-api.SEUDOMINIO/docs`
 
-## 4. Serviços (systemd)
+## Atualizar
 
 ```bash
-sudo cp deploy/gymrats-api.service   /etc/systemd/system/
-sudo cp deploy/gymrats-sync.service  /etc/systemd/system/
-sudo cp deploy/gymrats-sync.timer    /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now gymrats-api.service     # sobe a API
-sudo systemctl enable --now gymrats-sync.timer      # agenda o sync de 60 em 60 min
-# conferir:
-systemctl status gymrats-api
-systemctl list-timers | grep gymrats
+cd ~/gr-api && git pull && docker compose up -d --build
 ```
 
-## 5. nginx + HTTPS
+## Backup
+
+O banco é só um arquivo, e dá pra refazer do zero com um sync. Se quiser guardar:
 
 ```bash
-sudo cp deploy/nginx-gymrats.conf /etc/nginx/sites-available/gymrats
-sudo ln -s /etc/nginx/sites-available/gymrats /etc/nginx/sites-enabled/
-sudo nano /etc/nginx/sites-available/gymrats   # ajuste server_name
-sudo nginx -t && sudo systemctl reload nginx
-sudo apt install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d api.seudominio.com
+docker compose exec gr-api python -c "import sqlite3; s=sqlite3.connect('/data/gymrats.db'); s.backup(sqlite3.connect('/data/backup.db'))"
+mv data/backup.db ~/gymrats-$(date +%F).db
 ```
-
-## 6. Testar
-
-```bash
-curl https://api.seudominio.com/health
-curl -H "X-API-Key: SUA_CHAVE" https://api.seudominio.com/challenges
-```
-Docs interativas (Swagger): `https://api.seudominio.com/docs`
 
 ---
 
@@ -102,7 +113,7 @@ Todas (menos `/health`) exigem header `X-API-Key` se `GYMRATS_API_KEY` estiver s
 ## Consumindo no React
 
 ```js
-const API = "https://api.seudominio.com";
+const API = "https://gr-api.seudominio.com.br";
 const KEY = import.meta.env.VITE_GYMRATS_KEY;   // guarde a chave em env, nao no codigo
 
 const api = (path) =>
@@ -126,11 +137,18 @@ const stats      = await api(`/challenges/${id}/stats`);
 
 ## Renovação do token (quando expirar → 401 no sync)
 
-O JWT é de vida longa, mas quando expirar:
+O JWT é de vida longa. Quando expirar, `docker compose logs gr-api-sync` mostra o 401
+e a API continua servindo os últimos dados sincronizados.
+
 1. Na sua máquina, reabra o app no emulador e extraia um token novo
    (`adb pull … authentication.preferences_pb` + `python extract_token.py …`).
-2. Copie o novo valor para `GYMRATS_TOKEN` no `/opt/gymrats/.env` do VPS.
-3. `sudo systemctl start gymrats-sync.service` (ou espere o próximo ciclo).
+2. Na VPS, troque o token no `.env` e recrie o sync. `restart` não relê o `.env`; `up -d` relê:
+   ```bash
+   cd ~/gr-api
+   sed -i '/^GYMRATS_TOKEN=/d' .env
+   read -rsp "Token GymRats: " T && echo "GYMRATS_TOKEN=$T" >> .env; unset T; echo
+   docker compose up -d
+   ```
 
 > Dica: dá pra automatizar essa renovação com um emulador no próprio VPS, mas é bem mais
 > trabalhoso. Para uso pessoal, renovar manualmente a cada expiração costuma bastar.

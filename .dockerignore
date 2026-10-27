@@ -1,0 +1,17 @@
+.git/
+.venv/
+**/__pycache__/
+**/*.pyc
+data/
+dumps/
+datastore_dump/
+templates/
+*.md
+*.db
+*.db-*
+*.log
+*.png
+.env
+.token.json
+docker-compose*.yml
+Caddyfile.example

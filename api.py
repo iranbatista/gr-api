@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Optional
@@ -47,7 +48,7 @@ app.add_middleware(
 
 # ---------- infra ----------
 def require_key(x_api_key: Optional[str] = Header(default=None)):
-    if API_KEY and x_api_key != API_KEY:
+    if API_KEY and not secrets.compare_digest((x_api_key or "").encode(), API_KEY.encode()):
         raise HTTPException(status_code=401, detail="X-API-Key ausente ou invalida")
 
 

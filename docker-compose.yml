@@ -1,0 +1,48 @@
+# Produção (VPS). Segredos no .env ao lado deste arquivo (fora do git), veja
+# .env.example. Subir/atualizar:  docker compose up -d --build
+x-logging: &logging
+  # uvicorn loga uma linha por request; sem limite o log cresce para sempre.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-app: &app
+  build: .
+  image: gr-api-app
+  restart: unless-stopped
+  volumes:
+    # SQLite compartilhado entre API e sync. Bind mount (não volume nomeado)
+    # para ficar visível no host: backup com cp/tar.
+    - ./data:/data
+  logging: *logging
+
+services:
+  # Nome do serviço prefixado: o compose o registra como alias DNS na rede
+  # "web", compartilhada com outros stacks da VPS; "api" poderia colidir.
+  gr-api:
+    <<: *app
+    container_name: gr-api
+    environment:
+      GYMRATS_API_KEY: ${GYMRATS_API_KEY:?defina GYMRATS_API_KEY no .env}
+      GYMRATS_CORS: ${GYMRATS_CORS:-*}
+    networks: [web]
+
+  # Substitui o timer do systemd: roda o sync, dorme 1h, repete. Se o token
+  # expirar o sync falha com 401, loga e tenta de novo no próximo ciclo.
+  gr-api-sync:
+    <<: *app
+    container_name: gr-api-sync
+    command: ["sh", "-c", "while true; do python sync.py; sleep 3600; done"]
+    environment:
+      GYMRATS_TOKEN: ${GYMRATS_TOKEN:?defina GYMRATS_TOKEN no .env}
+      GYMRATS_BASE_URL: ${GYMRATS_BASE_URL:-https://www.gymrats.app/api}
+    # Sem HTTP: o healthcheck da imagem (request na API) não se aplica aqui.
+    healthcheck:
+      disable: true
+    # Rede default do compose: só precisa sair para a internet (GymRats).
+    networks: [default]
+
+networks:
+  web:
+    external: true

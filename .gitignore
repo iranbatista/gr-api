@@ -7,3 +7,4 @@ datastore_dump/
 emu_*.png
 
 *.log
+data/

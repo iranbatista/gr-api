@@ -1,0 +1,10 @@
+# Adicionar ao Caddyfile existente da VPS (~/caddy/Caddyfile), trocando o
+# domínio. O DNS (registro A) de gr-api.<seu domínio> precisa apontar para a VPS
+# antes do reload, senão o Let's Encrypt não emite o certificado.
+#
+# A API já exige X-API-Key em todas as rotas de dados (só /, /health e /docs
+# são públicas), então não precisa de basic_auth aqui.
+
+gr-api.seudominio.com.br {
+	reverse_proxy gr-api:8000
+}

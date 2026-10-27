@@ -44,7 +44,7 @@ EMAIL = os.environ.get("GYMRATS_EMAIL", "")
 # Token JWT extraído do app (ver README). Prioridade sobre login por e-mail/senha.
 ENV_TOKEN = os.environ.get("GYMRATS_TOKEN", "")
 HERE = Path(__file__).resolve().parent
-DB_PATH = HERE / "gymrats.db"
+DB_PATH = Path(os.environ.get("GYMRATS_DB") or HERE / "gymrats.db")
 TOKEN_CACHE = HERE / ".token.json"          # fora do git (.gitignore)
 DUMP_DIR = HERE / "dumps"
 MIN_INTERVAL_S = 1.0                          # sem rajadas
@@ -187,6 +187,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
 
 def db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
+    # WAL: a API (outro processo) continua lendo enquanto o sync grava.
+    con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
     return con
 

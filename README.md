@@ -14,7 +14,8 @@ com um sincronizador que alimenta um SQLite e um dashboard local.
 | `api.py` | **REST API** (FastAPI) que serve o SQLite. CORS, API key, paginação, filtros, `/stats`, Swagger em `/docs`. |
 | `app.py` + `templates/` | Dashboard local (Flask) para visualizar rápido em `127.0.0.1:5000`. |
 | `extract_token.py` | Extrai o JWT do `authentication.preferences_pb` (DataStore do app) para `.token.json`. |
-| `deploy/` | systemd (API + timer de sync) e nginx para subir num VPS. |
+| `Dockerfile` + `docker-compose.yml` | Deploy na VPS: container da API + container do sync (loop de 60 min), SQLite em `./data`. |
+| `Caddyfile.example` | Bloco para o Caddy da VPS (reverse proxy + HTTPS). |
 | `DEPLOY.md` | Guia de deploy no VPS + exemplo de consumo no React. |
 | `REPORT.md` | Como a API foi descoberta (engenharia reversa do app). |
 
@@ -42,10 +43,10 @@ Veja `.env.example`. Principais: `GYMRATS_TOKEN`, `GYMRATS_API_KEY`, `GYMRATS_CO
 
 ## Deploy no VPS
 
-Veja [`DEPLOY.md`](DEPLOY.md): venv + systemd (API e timer de sync de 60 min) + nginx/HTTPS,
+Veja [`DEPLOY.md`](DEPLOY.md): Docker Compose (API + sync de 60 em 60 min) atrás do Caddy da VPS,
 e um exemplo de `fetch` para consumir no React.
 
 ## Segredos
 
-`.token.json`, `gymrats.db`, `.env`, `datastore_dump/` e dumps **não** são versionados
+`.token.json`, `gymrats.db`, `data/`, `.env`, `datastore_dump/` e dumps **não** são versionados
 (ver `.gitignore`). Nunca comite seu token nem o banco (contém dados dos membros do grupo).
