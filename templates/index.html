@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GymRats — Dashboard local</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1f232c; --line:#2a2f3a;
+    --txt:#e8eaed; --muted:#9aa3b2; --accent:#ff5a1f; --ok:#3ecf8e; --warn:#f5a623;
+    --bar:#ff7a45;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#f6f7f9; --panel:#fff; --panel2:#eef0f4; --line:#e2e5ea;
+      --txt:#1a1d23; --muted:#5b6270; --accent:#ff5a1f; --bar:#ff7a45;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.5 "Nunito",system-ui,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;
+    border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+  header h1{font-size:18px;margin:0;font-weight:800}
+  .logo{width:28px;height:28px;border-radius:8px;background:var(--accent);
+    display:grid;place-items:center;color:#fff;font-weight:900}
+  .spacer{flex:1}
+  .pill{font-size:12px;color:var(--muted);border:1px solid var(--line);
+    padding:4px 10px;border-radius:999px}
+  .pill.ok{color:var(--ok);border-color:var(--ok)}
+  main{max-width:1000px;margin:0 auto;padding:20px 16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:18px;margin-bottom:16px}
+  label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+  input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--txt);font-size:14px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row>div{flex:1;min-width:180px}
+  button{cursor:pointer;border:0;border-radius:10px;padding:10px 16px;font-weight:700;
+    background:var(--accent);color:#fff;font-size:14px}
+  button.ghost{background:var(--panel2);color:var(--txt);border:1px solid var(--line)}
+  button:disabled{opacity:.5;cursor:default}
+  .tabs{display:flex;gap:6px;margin:4px 0 14px;flex-wrap:wrap}
+  .tabs button{background:var(--panel2);color:var(--muted);border:1px solid var(--line)}
+  .tabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+  .bar{height:10px;border-radius:6px;background:var(--bar)}
+  .barwrap{background:var(--panel2);border-radius:6px;overflow:hidden}
+  .wk{border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:10px;
+    background:var(--panel2)}
+  .wk .meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:13px}
+  .wk .meta b{color:var(--txt)}
+  .muted{color:var(--muted)}
+  .log{font:12px/1.5 ui-monospace,Consolas,monospace;color:var(--muted);
+    white-space:pre-wrap;max-height:130px;overflow:auto;background:var(--panel2);
+    border-radius:10px;padding:10px;border:1px solid var(--line)}
+  details summary{cursor:pointer;color:var(--muted);font-size:12px}
+  pre{background:var(--panel2);padding:10px;border-radius:8px;overflow:auto;font-size:12px}
+  .hidden{display:none}
+  .thumb{width:72px;height:72px;object-fit:cover;border-radius:8px;margin-right:8px}
+  .err{color:var(--warn)}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">GR</div>
+  <h1>GymRats · Dashboard local</h1>
+  <div class="spacer"></div>
+  <span id="statusPill" class="pill">verificando…</span>
+</header>
+
+<main>
+  <!-- LOGIN POR TOKEN -->
+  <section id="loginCard" class="card">
+    <h3 style="margin-top:0">Conectar com seu token</h3>
+    <p class="muted" style="margin-top:0">
+      Só leitura. O token fica só na sua máquina. Cole o <b>JWT</b> do app GymRats abaixo.
+    </p>
+    <details style="margin:8px 0">
+      <summary>como obter o token do app</summary>
+      <div class="muted" style="font-size:13px;margin-top:8px">
+        O token é um JWT que o app guarda após você logar. Formas de obtê-lo:
+        <ul>
+          <li><b>Captura de tráfego (recomendado):</b> abra o app atrás de um proxy (ex.: mitmproxy/HTTP Toolkit),
+            navegue, e copie o valor do header <code>Authorization</code> das chamadas a
+            <code>www.gymrats.app/api</code>.</li>
+          <li><b>Celular com root / emulador:</b> leia o DataStore do app
+            (<code>/data/data/com.hasz.gymrats.app/files/datastore/</code>).</li>
+        </ul>
+        Posso te ajudar com qualquer uma dessas — é só pedir.
+      </div>
+    </details>
+    <label>Token (JWT)</label>
+    <input id="token" type="password" placeholder="eyJ…" autocomplete="off">
+    <label>Servidor</label>
+    <select id="baseUrl">
+      <option value="https://www.gymrats.app/api">produção (www.gymrats.app/api)</option>
+    </select>
+    <div style="margin-top:14px"><button id="btnLogin">Conectar</button></div>
+    <p id="loginErr" class="err"></p>
+  </section>
+
+  <!-- APP -->
+  <section id="appCard" class="hidden">
+    <div class="card">
+      <div class="row" style="align-items:center">
+        <div style="flex:2">
+          <b id="whoami"></b>
+          <div class="muted" id="syncInfo">—</div>
+        </div>
+        <div style="flex:0;display:flex;gap:8px">
+          <button id="btnSync">Sincronizar agora</button>
+          <button id="btnLogout" class="ghost">Sair</button>
+        </div>
+      </div>
+      <details style="margin-top:10px"><summary>log</summary>
+        <div id="log" class="log"></div></details>
+    </div>
+
+    <div class="card">
+      <div class="row" style="align-items:flex-end">
+        <div style="flex:2">
+          <label>Desafio / clube</label>
+          <select id="challengeSel"></select>
+        </div>
+      </div>
+      <div class="tabs" style="margin-top:14px">
+        <button data-tab="rank" class="active">🏆 Ranking</button>
+        <button data-tab="checkins">✅ Check-ins</button>
+        <button data-tab="info">ℹ️ Detalhe / regras</button>
+      </div>
+      <div id="tab-rank"></div>
+      <div id="tab-checkins" class="hidden"></div>
+      <div id="tab-info" class="hidden"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = (p,o) => fetch(p,o).then(r=>r.json());
+let challenges = [], curTab = "rank";
+
+async function refreshStatus(){
+  const s = await api("/api/status");
+  const pill = $("#statusPill");
+  if(s.logged_in){
+    pill.textContent = "conectado"; pill.className="pill ok";
+    $("#loginCard").classList.add("hidden");
+    $("#appCard").classList.remove("hidden");
+    $("#whoami").textContent = "conectado · " + s.base_url.replace("https://","");
+    $("#syncInfo").textContent = s.last_sync
+      ? "último sync: " + new Date(s.last_sync).toLocaleString()
+      : "ainda não sincronizado — clique em “Sincronizar agora”.";
+    $("#btnSync").disabled = s.syncing;
+    $("#btnSync").textContent = s.syncing ? "sincronizando…" : "Sincronizar agora";
+    $("#log").textContent = (s.log||[]).join("\n");
+    if(s.syncing) setTimeout(refreshStatus, 1500);
+  }else{
+    pill.textContent="desconectado"; pill.className="pill";
+    $("#loginCard").classList.remove("hidden");
+    $("#appCard").classList.add("hidden");
+  }
+  return s;
+}
+
+$("#btnLogin").onclick = async () => {
+  $("#loginErr").textContent=""; $("#btnLogin").disabled=true;
+  $("#btnLogin").textContent="validando…";
+  const r = await api("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({token:$("#token").value,base_url:$("#baseUrl").value})});
+  $("#btnLogin").disabled=false; $("#btnLogin").textContent="Conectar";
+  if(!r.ok){ $("#loginErr").textContent = "Erro: "+r.error; return; }
+  $("#token").value="";
+  await refreshStatus(); await loadChallenges();
+};
+
+$("#btnLogout").onclick = async () => { await api("/api/logout",{method:"POST"}); refreshStatus(); };
+
+$("#btnSync").onclick = async () => {
+  $("#btnSync").disabled=true;
+  await api("/api/sync",{method:"POST"});
+  refreshStatus();
+};
+
+async function loadChallenges(){
+  challenges = await api("/api/challenges");
+  const sel = $("#challengeSel");
+  sel.innerHTML = challenges.map(c=>`<option value="${c.id}">${c.name||("Desafio "+c.id)}</option>`).join("");
+  if(challenges.length){ renderTab(); }
+  else { $("#tab-rank").innerHTML='<p class="muted">Nenhum dado ainda. Clique em “Sincronizar agora”.</p>'; }
+}
+
+document.querySelectorAll(".tabs button").forEach(b=>{
+  b.onclick=()=>{ curTab=b.dataset.tab;
+    document.querySelectorAll(".tabs button").forEach(x=>x.classList.toggle("active",x===b));
+    ["rank","checkins","info"].forEach(t=>$("#tab-"+t).classList.toggle("hidden",t!==curTab));
+    renderTab(); };
+});
+$("#challengeSel").onchange = renderTab;
+
+function curId(){ return $("#challengeSel").value; }
+const num = v => (v===0||v)?v:"—";
+
+async function renderTab(){
+  const cid = curId(); if(!cid) return;
+  if(curTab==="rank") return renderRank(cid);
+  if(curTab==="checkins") return renderCheckins(cid);
+  if(curTab==="info") return renderInfo(cid);
+}
+
+async function renderRank(cid){
+  const el=$("#tab-rank"); el.innerHTML="carregando…";
+  const rows = await api(`/api/challenges/${cid}/rankings`);
+  if(!rows.length){ el.innerHTML='<p class="muted">Sem ranking salvo. Sincronize.</p>'; return; }
+  const max = Math.max(...rows.map(r=>r.points||0),1);
+  el.innerHTML = `<table><thead><tr><th>#</th><th>Membro</th><th>Pontos</th><th style="width:40%"></th></tr></thead><tbody>`+
+    rows.map((r,i)=>`<tr><td>${num(r.rank)||i+1}</td><td>${r.name}</td><td>${num(r.points)}</td>
+      <td><div class="barwrap"><div class="bar" style="width:${Math.round(100*(r.points||0)/max)}%"></div></div></td></tr>`).join("")+
+    `</tbody></table>`;
+}
+
+async function renderCheckins(cid){
+  const el=$("#tab-checkins"); el.innerHTML="carregando…";
+  const rows = await api(`/api/challenges/${cid}/workouts`);
+  if(!rows.length){ el.innerHTML='<p class="muted">Sem check-ins salvos. Sincronize.</p>'; return; }
+  el.innerHTML = `<p class="muted">${rows.length} check-in(s) — mais recentes primeiro</p>` + rows.map(r=>{
+    const w=r.raw||{};
+    const acc=(w.account||{}).full_name || (w.account||{}).name || ("acc "+(r.account_id??"?"));
+    const photos=[].concat(w.photo_url||[], w.photos||[], w.media_url||[]).filter(Boolean);
+    const when = r.occurred_on ? new Date(r.occurred_on).toLocaleString() : "—";
+    const field=(label,val,suf="")=> (val===0||val)?`<span><b>${val}${suf}</b> ${label}</span>`:"";
+    return `<div class="wk">
+      <div style="display:flex;justify-content:space-between"><b>${acc}</b><span class="muted">${when}</span></div>
+      <div style="margin:6px 0">${w.title||w.activity||w.activity_type||w.exercise||"check-in"}</div>
+      <div class="meta">
+        ${field("min", w.duration||w.minutes)}
+        ${field("km", w.distance)}
+        ${field("kcal", w.calories)}
+        ${field("pts", w.points||w.score)}
+        ${field("steps", w.steps)}
+      </div>
+      ${photos.length?`<div style="margin-top:8px">${photos.map(p=>`<img class="thumb" src="${p}">`).join("")}</div>`:""}
+      ${w.description?`<div style="margin-top:6px">${w.description}</div>`:""}
+      <details style="margin-top:6px"><summary>ver JSON</summary><pre>${JSON.stringify(w,null,2)}</pre></details>
+    </div>`;
+  }).join("");
+}
+
+function renderInfo(cid){
+  const c = challenges.find(x=>String(x.id)===String(cid));
+  const el=$("#tab-info");
+  if(!c){ el.innerHTML='<p class="muted">—</p>'; return; }
+  el.innerHTML = `<p class="muted">início ${c.start||"?"} · fim ${c.end||"?"} · membros ${num(c.members)}</p>
+    <details open><summary>JSON completo (regras de pontuação etc.)</summary>
+    <pre>${JSON.stringify(c.raw,null,2)}</pre></details>`;
+}
+
+refreshStatus().then(s=>{ if(s.logged_in) loadChallenges(); });
+</script>
+</body>
+</html>

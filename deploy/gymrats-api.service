@@ -1,0 +1,15 @@
+[Unit]
+Description=GymRats Personal REST API (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=gymrats
+WorkingDirectory=/opt/gymrats
+EnvironmentFile=/opt/gymrats/.env
+ExecStart=/opt/gymrats/venv/bin/uvicorn api:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+.token.json
+gymrats.db
+dumps/
+__pycache__/
+.env
+datastore_dump/
+emu_*.png
+
+*.log
