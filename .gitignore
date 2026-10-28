@@ -9,3 +9,4 @@ emu_*.png
 *.log
 data/
 .pytest_cache/
+.thumbs/

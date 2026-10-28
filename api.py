@@ -15,22 +15,31 @@ Config por ambiente:
     GYMRATS_API_KEY   se definido, exige header  X-API-Key: <chave>  (recomendado no VPS)
     GYMRATS_CORS      origens permitidas separadas por virgula (default: *)
                       ex.: https://meuapp.com,https://www.meuapp.com
+    GYMRATS_IMG_CACHE pasta do cache de miniaturas do /img
+                      (default: /data/thumbs se /data existir, senao ./.thumbs)
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import secrets
 import sqlite3
+import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel
 
 DB_PATH = os.environ.get("GYMRATS_DB", os.path.join(os.path.dirname(__file__), "gymrats.db"))
@@ -44,6 +53,13 @@ GYMRATS_BASE = os.environ.get("GYMRATS_BASE_URL", "https://www.gymrats.app/api")
 TOKEN_CACHE_FILE = os.path.join(os.path.dirname(__file__), ".token.json")
 COMMENTS_TTL = float(os.environ.get("GYMRATS_COMMENTS_TTL", "60"))  # cache em segundos
 _comments_cache: dict[int, tuple[float, list]] = {}
+
+# Miniaturas (/img): so hosts/larguras da allowlist -> nao vira proxy aberto nem DoS de resize.
+IMG_HOSTS = {"cdn.gymrats.app"}
+IMG_WIDTHS = (64, 128, 256, 512, 1024)
+IMG_MAX_BYTES = 15 * 1024 * 1024
+IMG_CACHE_CONTROL = "public, max-age=31536000, immutable"
+_img_sem = threading.Semaphore(4)  # no maximo 4 downloads/resizes simultaneos
 
 app = FastAPI(
     title="GymRats Personal API",
@@ -373,6 +389,113 @@ def health():
         return {"status": "ok", "challenges": n, "db": os.path.basename(DB_PATH)}
     except sqlite3.Error as e:
         raise HTTPException(503, f"db indisponivel: {e}")
+
+
+def _img_cache_dir() -> str:
+    """Lido a cada chamada (testes trocam o env); criado sob demanda."""
+    d = os.environ.get("GYMRATS_IMG_CACHE") or (
+        "/data/thumbs" if os.path.isdir("/data") else os.path.join(os.path.dirname(__file__), ".thumbs"))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _img_url_ok(u: str) -> bool:
+    if len(u) > 512:
+        return False
+    try:
+        p = urlsplit(u)
+    except ValueError:
+        return False
+    # netloc exato: barra userinfo (a@host), porta (host:443) e sufixos (host.evil.com)
+    return (p.scheme == "https" and p.netloc in IMG_HOSTS and len(p.path) > 1
+            and not p.query and not p.fragment)
+
+
+def _img_fetch(u: str) -> bytes:
+    try:
+        # sem redirects: um 3xx poderia levar a outro host (SSRF)
+        r = requests.get(u, timeout=15, stream=True, allow_redirects=False,
+                         headers={"User-Agent": "gr-api/1.0"})
+    except requests.RequestException as e:
+        raise HTTPException(502, f"falha ao baixar imagem: {e}")
+    try:
+        if r.status_code == 404:
+            raise HTTPException(404, "imagem nao encontrada")
+        if r.status_code != 200:
+            raise HTTPException(502, f"CDN respondeu {r.status_code}")
+        if not (r.headers.get("Content-Type") or "").lower().startswith("image/"):
+            raise HTTPException(502, "upstream nao e imagem")
+        if int(num(r.headers.get("Content-Length"))) > IMG_MAX_BYTES:
+            raise HTTPException(502, "imagem grande demais")
+        buf = bytearray()
+        for chunk in r.iter_content(65536):
+            buf += chunk
+            if len(buf) > IMG_MAX_BYTES:
+                raise HTTPException(502, "imagem grande demais")
+        return bytes(buf)
+    except requests.RequestException as e:
+        raise HTTPException(502, f"falha ao baixar imagem: {e}")
+    finally:
+        r.close()
+
+
+def _img_thumb(data: bytes, w: int) -> bytes:
+    try:
+        im = Image.open(io.BytesIO(data))
+        # proporcao do original (ja rotacionado pelo EXIF): o draft arredonda e distorce um pouco
+        ow, oh = im.size
+        if im.getexif().get(0x0112) in (5, 6, 7, 8):
+            ow, oh = oh, ow
+        if im.format == "JPEG":
+            im.draft(None, (w, w))  # decodifica JPEG ja reduzido (DCT), >= w nos 2 lados
+        im = ImageOps.exif_transpose(im)
+        alpha = im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
+        im = im.convert("RGBA" if alpha else "RGB")
+        if ow > w:  # nunca amplia
+            im = im.resize((w, max(1, round(oh * w / ow))), Image.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, "WEBP", quality=82, method=6)
+        return out.getvalue()
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as e:
+        raise HTTPException(502, f"imagem invalida: {e.__class__.__name__}")
+
+
+@app.get("/img", tags=["meta"], response_class=Response,
+         responses={200: {"content": {"image/webp": {}}}, 304: {"description": "nao modificado"}})
+def img(u: str = Query(..., description="URL https://cdn.gymrats.app/..."),
+        w: int = Query(..., description=f"largura, uma de {IMG_WIDTHS}"),
+        if_none_match: Optional[str] = Header(default=None)):
+    """Miniatura WebP de uma imagem do CDN do GymRats, cacheada em disco (publico: <img> nao manda header)."""
+    if not _img_url_ok(u):
+        raise HTTPException(400, "u deve ser https://cdn.gymrats.app/<arquivo>")
+    if w not in IMG_WIDTHS:
+        raise HTTPException(400, f"w deve ser um de {list(IMG_WIDTHS)}")
+    key = f"{hashlib.sha256(u.encode()).hexdigest()}_{w}"
+    headers = {"Cache-Control": IMG_CACHE_CONTROL, "ETag": f'"{key}"'}
+    # conteudo e funcao de (u, w) e o CDN e imutavel (uuid): ETag igual -> 304 sem tocar no disco
+    if if_none_match and (if_none_match.strip() == "*" or f'"{key}"' in
+                          [t.strip().removeprefix("W/") for t in if_none_match.split(",")]):
+        return Response(status_code=304, headers=headers)
+    d = _img_cache_dir()
+    path = os.path.join(d, key + ".webp")
+    if not os.path.exists(path):
+        if not _img_sem.acquire(timeout=30):
+            raise HTTPException(503, "ocupado, tente de novo")
+        try:
+            if not os.path.exists(path):  # outra thread pode ter gerado enquanto esperava
+                thumb = _img_thumb(_img_fetch(u), w)
+                fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(thumb)
+                    os.replace(tmp, path)  # atomico: nunca serve arquivo pela metade
+                except BaseException:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    raise
+        finally:
+            _img_sem.release()
+    return FileResponse(path, media_type="image/webp", headers=headers)
 
 
 # ---------- rotas de dados (protegidas por API key, se configurada) ----------

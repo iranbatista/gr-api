@@ -108,13 +108,17 @@ mv data/backup.db ~/gymrats-$(date +%F).db
 | GET | `/challenges/{id}/stats` | agregados p/ dashboard (por dia, por membro) |
 | GET | `/challenges/{id}/insights` | agregados ricos p/ dashboard: série diária, punchcard 7×24, períodos, duração por dia da semana, sequências, prêmios, top check-ins, emojis (fuso `GYMRATS_TZ`) |
 | GET | `/meta/sync` | última sincronização |
+| GET | `/img?u=<url>&w=<64\|128\|256\|512\|1024>` | miniatura WebP de uma imagem do CDN (público; só `https://cdn.gymrats.app/...` e larguras da lista, senão 400). Gerada uma vez e cacheada em `data/thumbs` (`Cache-Control: immutable` + `ETag`/304). Limpar o cache: `rm -rf data/thumbs` |
 
 > **Reações** já vêm embutidas em cada check-in (campo `reactions`: quem reagiu + emoji).
 > **Comentários** não são sincronizados no banco (seriam ~1 request por check-in); o endpoint
 > `/workouts/{id}/comments` os busca no GymRats na hora, com cache curto. Por isso o container
 > `gr-api` também recebe o `GYMRATS_TOKEN` (ver `docker-compose.yml`).
 
-Todas (menos `/health`) exigem header `X-API-Key` se `GYMRATS_API_KEY` estiver setado.
+Todas (menos `/health` e `/img`) exigem header `X-API-Key` se `GYMRATS_API_KEY` estiver setado.
+`/img` é público porque `<img src>` não manda header; a allowlist de host/largura evita que vire
+proxy aberto ou alvo de resize arbitrário. Ex.: `<img src={`${API}/img?u=${encodeURIComponent(url)}&w=128`} width={40} height={40}>`
+(use ~2–3× o tamanho exibido para telas retina).
 
 ---
 
