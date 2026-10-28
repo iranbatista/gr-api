@@ -22,11 +22,13 @@ import json
 import os
 import secrets
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -36,6 +38,12 @@ API_KEY = os.environ.get("GYMRATS_API_KEY", "")
 # Fuso usado para agrupar check-ins por dia (by_day, active_days).
 TZ = ZoneInfo(os.environ.get("GYMRATS_TZ", "America/Sao_Paulo"))
 CORS_ORIGINS = [o.strip() for o in os.environ.get("GYMRATS_CORS", "*").split(",") if o.strip()]
+
+# Comentarios sao buscados no GymRats sob demanda (nao sao sincronizados no banco).
+GYMRATS_BASE = os.environ.get("GYMRATS_BASE_URL", "https://www.gymrats.app/api").rstrip("/")
+TOKEN_CACHE_FILE = os.path.join(os.path.dirname(__file__), ".token.json")
+COMMENTS_TTL = float(os.environ.get("GYMRATS_COMMENTS_TTL", "60"))  # cache em segundos
+_comments_cache: dict[int, tuple[float, list]] = {}
 
 app = FastAPI(
     title="GymRats Personal API",
@@ -87,6 +95,45 @@ def inum(v):
     return int(num(v)) if v is not None else None
 
 
+def _gymrats_token() -> Optional[str]:
+    """Token p/ o proxy de comentarios: env GYMRATS_TOKEN ou .token.json (local)."""
+    t = os.environ.get("GYMRATS_TOKEN")
+    if t:
+        return t
+    try:
+        with open(TOKEN_CACHE_FILE, encoding="utf-8") as f:
+            return json.load(f).get("token")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _fetch_comments(wid: int) -> list:
+    """Busca os comentarios de um check-in no GymRats, com cache curto em memoria."""
+    now = time.time()
+    hit = _comments_cache.get(wid)
+    if hit and now - hit[0] < COMMENTS_TTL:
+        return hit[1]
+    token = _gymrats_token()
+    if not token:
+        raise HTTPException(503, "comentarios indisponiveis: defina GYMRATS_TOKEN na API")
+    try:
+        r = requests.get(f"{GYMRATS_BASE}/workouts/{wid}/comments",
+                         headers={"Authorization": token, "User-Agent": "gr-api/1.0"},
+                         timeout=15)
+    except requests.RequestException as e:
+        raise HTTPException(502, f"falha ao consultar o GymRats: {e}")
+    if r.status_code == 401:
+        raise HTTPException(502, "token do GymRats expirado/invalido")
+    if r.status_code == 404:
+        return []
+    if not r.ok:
+        raise HTTPException(502, f"GymRats respondeu {r.status_code}")
+    data = r.json()
+    items = (data.get("data") if isinstance(data, dict) else data) or []
+    _comments_cache[wid] = (now, items)
+    return items
+
+
 # ---------- modelos (contrato p/ o React + OpenAPI) ----------
 class Account(BaseModel):
     id: Optional[int] = None
@@ -124,6 +171,21 @@ class Member(BaseModel):
     twitter: Optional[str] = None
 
 
+class Reaction(BaseModel):
+    reaction: Optional[str] = None   # o emoji
+    account: Account
+
+
+class Comment(BaseModel):
+    id: int
+    workout_id: Optional[int] = None
+    content: Optional[str] = None
+    created_at: Optional[str] = None
+    account: Account
+    reactions: list[Reaction] = []
+    media_details: Optional[Any] = None
+
+
 class Workout(BaseModel):
     id: int
     challenge_id: int
@@ -140,6 +202,8 @@ class Workout(BaseModel):
     description: Optional[str] = None
     photo_url: Optional[str] = None
     media: Optional[Any] = None
+    reactions: list[Reaction] = []       # embutidas no check-in
+    comment_count: Optional[int] = None  # conteudo em /workouts/{id}/comments
 
 
 class WorkoutPage(BaseModel):
@@ -172,6 +236,25 @@ def shape_account(d: dict) -> Account:
                    profile_picture_url=d.get("profile_picture_url"))
 
 
+def shape_reactions(lst) -> list[Reaction]:
+    out = []
+    for x in (lst or []):
+        if isinstance(x, dict):
+            out.append(Reaction(reaction=x.get("reaction"),
+                                account=shape_account(x.get("account") or {})))
+    return out
+
+
+def shape_comment(d: dict) -> Comment:
+    return Comment(
+        id=d.get("id"), workout_id=d.get("workout_id"),
+        content=d.get("content"), created_at=d.get("created_at"),
+        account=shape_account(d.get("account") or {}),
+        reactions=shape_reactions(d.get("reactions")),
+        media_details=d.get("media_details"),
+    )
+
+
 def shape_workout(row) -> Workout:
     w = _raw(row)
     acc = w.get("account") or {}
@@ -185,6 +268,8 @@ def shape_workout(row) -> Workout:
         points=(num(w.get("points")) if w.get("points") is not None else None),
         steps=inum(w.get("steps")), description=w.get("description"),
         photo_url=w.get("photo_url"), media=w.get("media"),
+        reactions=shape_reactions(w.get("reactions")),
+        comment_count=inum(w.get("comment_count")),
     )
 
 
@@ -282,6 +367,30 @@ def challenge_workouts(
             (*args, limit, offset)).fetchall()
     return WorkoutPage(items=[shape_workout(r) for r in rows],
                        total=total, limit=limit, offset=offset)
+
+
+@app.get("/workouts/{wid}", response_model=Workout, tags=["workouts"],
+         dependencies=[Depends(require_key)])
+def get_workout(wid: int):
+    """Um check-in (do banco), com reacoes embutidas e o comment_count."""
+    with db() as con:
+        row = con.execute(
+            "SELECT id,challenge_id,account_id,occurred_on,raw FROM workouts WHERE id=?",
+            (wid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "check-in nao encontrado")
+    return shape_workout(row)
+
+
+@app.get("/workouts/{wid}/comments", response_model=list[Comment], tags=["workouts"],
+         dependencies=[Depends(require_key)])
+def workout_comments(wid: int):
+    """Comentarios de um check-in. Buscados no GymRats sob demanda (cache ~60s).
+
+    Cada comentario tem autor, texto, data e suas proprias reacoes.
+    Requer GYMRATS_TOKEN configurado na API.
+    """
+    return [shape_comment(c) for c in _fetch_comments(wid)]
 
 
 def local_day(occurred_on: Optional[str]) -> Optional[str]:

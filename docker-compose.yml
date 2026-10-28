@@ -26,6 +26,9 @@ services:
     environment:
       GYMRATS_API_KEY: ${GYMRATS_API_KEY:?defina GYMRATS_API_KEY no .env}
       GYMRATS_CORS: ${GYMRATS_CORS:-*}
+      # Token tambem aqui: o endpoint /workouts/{id}/comments busca no GymRats sob demanda.
+      GYMRATS_TOKEN: ${GYMRATS_TOKEN:-}
+      GYMRATS_BASE_URL: ${GYMRATS_BASE_URL:-https://www.gymrats.app/api}
     networks: [web]
 
   # Substitui o timer do systemd: roda o sync, dorme 1h, repete. Se o token

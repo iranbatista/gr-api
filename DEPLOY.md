@@ -102,9 +102,16 @@ mv data/backup.db ~/gymrats-$(date +%F).db
 | GET | `/challenges/{id}` | um desafio |
 | GET | `/challenges/{id}/members` | membros |
 | GET | `/challenges/{id}/rankings` | ranking (rank, score, account) |
-| GET | `/challenges/{id}/workouts` | check-ins — `?limit=&offset=&member_id=&since=&until=` |
+| GET | `/challenges/{id}/workouts` | check-ins (com reações embutidas) — `?limit=&offset=&member_id=&since=&until=` |
+| GET | `/workouts/{id}` | um check-in (reações + `comment_count`) |
+| GET | `/workouts/{id}/comments` | comentários do check-in — busca no GymRats sob demanda (cache ~60s); **requer `GYMRATS_TOKEN` na API** |
 | GET | `/challenges/{id}/stats` | agregados p/ dashboard (por dia, por membro) |
 | GET | `/meta/sync` | última sincronização |
+
+> **Reações** já vêm embutidas em cada check-in (campo `reactions`: quem reagiu + emoji).
+> **Comentários** não são sincronizados no banco (seriam ~1 request por check-in); o endpoint
+> `/workouts/{id}/comments` os busca no GymRats na hora, com cache curto. Por isso o container
+> `gr-api` também recebe o `GYMRATS_TOKEN` (ver `docker-compose.yml`).
 
 Todas (menos `/health`) exigem header `X-API-Key` se `GYMRATS_API_KEY` estiver setado.
 
