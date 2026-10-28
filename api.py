@@ -251,12 +251,22 @@ class Award(BaseModel):
     value: int
 
 
+class DuoAward(BaseModel):
+    accounts: list[Account]   # exatamente 2, ordenados por id
+    value: int                # total de reacoes trocadas (a_to_b + b_to_a)
+    a_to_b: int               # reacoes de accounts[0] em check-ins de accounts[1]
+    b_to_a: int               # reacoes de accounts[1] em check-ins de accounts[0]
+
+
 class Awards(BaseModel):
     early_bird: Optional[Award] = None
     night_owl: Optional[Award] = None
     most_reactions: Optional[Award] = None
     most_comments: Optional[Award] = None
     most_reactions_given: Optional[Award] = None
+    marathoner: Optional[Award] = None      # value = minutos totais (int)
+    weekend: Optional[Award] = None         # check-ins em sabado/domingo (hora local)
+    dynamic_duo: Optional[DuoAward] = None
 
 
 class TopWorkout(BaseModel):
@@ -601,6 +611,9 @@ def challenge_insights(cid: int):
     comments_recv: dict[int, int] = {}
     reacts_given: dict[int, int] = {}
     reactor_acc: dict[int, dict] = {}
+    minutes_by: dict[int, float] = {}
+    weekend: dict[int, int] = {}
+    reacts_on: dict[tuple[int, int], int] = {}   # (quem reagiu, dono do check-in) -> n
     emojis: dict[str, int] = {}
     tops: list[tuple] = []
     minutes_total = 0.0
@@ -614,6 +627,7 @@ def challenge_insights(cid: int):
         n_workouts[aid] = n_workouts.get(aid, 0) + 1
         dur = num(w.get("duration"))
         minutes_total += dur
+        minutes_by[aid] = minutes_by.get(aid, 0.0) + dur
         reactions = [x for x in (w.get("reactions") or []) if isinstance(x, dict)]
         cc = inum(w.get("comment_count")) or 0
         reacts_recv[aid] = reacts_recv.get(aid, 0) + len(reactions)
@@ -626,6 +640,8 @@ def challenge_insights(cid: int):
                 rid = inum(ra["id"])
                 reacts_given[rid] = reacts_given.get(rid, 0) + 1
                 reactor_acc.setdefault(rid, ra)
+                if rid != aid:  # auto-reacao nao conta p/ dupla
+                    reacts_on[(rid, aid)] = reacts_on.get((rid, aid), 0) + 1
         if len(reactions) + cc > 0:
             tops.append((len(reactions) + cc, r["occurred_on"] or "", r, w, len(reactions), cc))
 
@@ -645,6 +661,8 @@ def challenge_insights(cid: int):
             early[aid] = early.get(aid, 0) + 1
         if h >= 21:
             night[aid] = night.get(aid, 0) + 1
+        if wd >= 5:
+            weekend[aid] = weekend.get(aid, 0) + 1
 
     def acc_of(aid: int) -> Account:
         a = shape_account(accounts.get(aid) or members.get(aid) or reactor_acc.get(aid) or {})
@@ -664,6 +682,21 @@ def challenge_insights(cid: int):
 
     # reacoes dadas: so quem e membro do desafio ou aparece nos check-ins
     reacts_given = {a: v for a, v in reacts_given.items() if a in members or a in accounts}
+
+    def dynamic_duo() -> Optional[DuoAward]:
+        """Par mais *mutuo* (maior min(a->b, b->a)), depois total, check-ins somados, nomes."""
+        g = {k: v for k, v in reacts_on.items() if k[0] in members or k[0] in accounts}
+        best = None
+        for x, y in {tuple(sorted(k)) for k in g}:
+            ab, ba = g.get((x, y), 0), g.get((y, x), 0)
+            key = (-min(ab, ba), -(ab + ba), -(n_workouts.get(x, 0) + n_workouts.get(y, 0)),
+                   sorted((name_of(x), name_of(y))))
+            if best is None or key < best[0]:
+                best = (key, x, y, ab, ba)
+        if best is None or best[0][0] == 0:  # dupla tem que ser mutua
+            return None
+        _, x, y, ab, ba = best
+        return DuoAward(accounts=[acc_of(x), acc_of(y)], value=ab + ba, a_to_b=ab, b_to_a=ba)
 
     today = _now().astimezone(TZ).date()
     streaks = []
@@ -693,7 +726,9 @@ def challenge_insights(cid: int):
         streaks=streaks[:5],
         awards=Awards(early_bird=award(early), night_owl=award(night),
                       most_reactions=award(reacts_recv), most_comments=award(comments_recv),
-                      most_reactions_given=award(reacts_given)),
+                      most_reactions_given=award(reacts_given),
+                      marathoner=award({a: int(round(m)) for a, m in minutes_by.items()}),
+                      weekend=award(weekend), dynamic_duo=dynamic_duo()),
         top_workouts=top_workouts,
         emojis=[EmojiCount(emoji=e, count=c)
                 for e, c in sorted(emojis.items(), key=lambda t: (-t[1], t[0]))[:8]],
