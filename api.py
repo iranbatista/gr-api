@@ -23,7 +23,9 @@ import os
 import secrets
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +33,8 @@ from pydantic import BaseModel
 
 DB_PATH = os.environ.get("GYMRATS_DB", os.path.join(os.path.dirname(__file__), "gymrats.db"))
 API_KEY = os.environ.get("GYMRATS_API_KEY", "")
+# Fuso usado para agrupar check-ins por dia (by_day, active_days).
+TZ = ZoneInfo(os.environ.get("GYMRATS_TZ", "America/Sao_Paulo"))
 CORS_ORIGINS = [o.strip() for o in os.environ.get("GYMRATS_CORS", "*").split(",") if o.strip()]
 
 app = FastAPI(
@@ -280,9 +284,25 @@ def challenge_workouts(
                        total=total, limit=limit, offset=offset)
 
 
+def local_day(occurred_on: Optional[str]) -> Optional[str]:
+    """Dia de calendario (YYYY-MM-DD) do instante no fuso GYMRATS_TZ."""
+    if not occurred_on:
+        return None
+    try:
+        dt = datetime.fromisoformat(occurred_on.replace("Z", "+00:00"))
+    except ValueError:
+        return occurred_on[:10] or None
+    if dt.tzinfo is None:  # sem fuso: trata como UTC, igual ao resto da API
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(TZ).date().isoformat()
+
+
 @app.get("/challenges/{cid}/stats", tags=["workouts"], dependencies=[Depends(require_key)])
 def challenge_stats(cid: int):
-    """Agregados prontos para dashboard: total, check-ins por dia e por membro."""
+    """Agregados prontos para dashboard: total, check-ins por dia e por membro.
+
+    Dias sao contados no fuso GYMRATS_TZ (default America/Sao_Paulo).
+    """
     with db() as con:
         rows = con.execute(
             "SELECT account_id,occurred_on,raw FROM workouts WHERE challenge_id=?", (cid,)).fetchall()
@@ -290,19 +310,23 @@ def challenge_stats(cid: int):
                    con.execute("SELECT id,raw FROM members WHERE challenge_id=?", (cid,)).fetchall()}
     by_day: dict[str, int] = {}
     by_member: dict[int, dict] = {}
+    member_days: dict[int, set[str]] = {}
     for r in rows:
-        day = (r["occurred_on"] or "")[:10]
+        day = local_day(r["occurred_on"])
         if day:
             by_day[day] = by_day.get(day, 0) + 1
         w = _raw(r)
         acc_id = r["account_id"]
-        m = by_member.setdefault(acc_id, {"account_id": acc_id, "workouts": 0,
+        m = by_member.setdefault(acc_id, {"account_id": acc_id, "workouts": 0, "active_days": 0,
                                           "points": 0.0, "calories": 0.0, "distance": 0.0})
         m["workouts"] += 1
+        if day:
+            member_days.setdefault(acc_id, set()).add(day)
         m["points"] += num(w.get("points"))
         m["calories"] += num(w.get("calories"))
         m["distance"] += num(w.get("distance"))
     for acc_id, m in by_member.items():
+        m["active_days"] = len(member_days.get(acc_id, ()))
         info = members.get(acc_id) or (_raw_from_any(rows, acc_id))
         m["name"] = (info or {}).get("full_name")
     return {
