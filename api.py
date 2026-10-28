@@ -24,7 +24,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -213,6 +213,82 @@ class WorkoutPage(BaseModel):
     offset: int
 
 
+# --- insights (agregados p/ o dashboard) ---
+class InsightsTotals(BaseModel):
+    workouts: int
+    minutes: float
+    athletes_active: int   # atletas com >=1 check-in
+
+
+class DailyPoint(BaseModel):
+    date: str              # YYYY-MM-DD no fuso GYMRATS_TZ
+    workouts: int
+    athletes: int          # atletas distintos no dia
+    minutes: float
+
+
+class Periods(BaseModel):
+    madrugada: int = 0     # 0-4h
+    manha: int = 0         # 5-11h
+    tarde: int = 0         # 12-17h
+    noite: int = 0         # 18-23h
+
+
+class WeekdayDuration(BaseModel):
+    weekday: int                         # 0 = segunda
+    workouts: int
+    avg_minutes: Optional[float] = None  # media so dos check-ins com duracao > 0
+
+
+class Streak(BaseModel):
+    account: Account
+    longest: int
+    current: int   # sequencia que termina hoje ou ontem (senao 0)
+
+
+class Award(BaseModel):
+    account: Account
+    value: int
+
+
+class Awards(BaseModel):
+    early_bird: Optional[Award] = None
+    night_owl: Optional[Award] = None
+    most_reactions: Optional[Award] = None
+    most_comments: Optional[Award] = None
+    most_reactions_given: Optional[Award] = None
+
+
+class TopWorkout(BaseModel):
+    id: int
+    title: Optional[str] = None
+    photo_url: Optional[str] = None
+    account: Account
+    occurred_at: Optional[str] = None
+    reactions_count: int
+    comment_count: int
+
+
+class EmojiCount(BaseModel):
+    emoji: str
+    count: int
+
+
+class Insights(BaseModel):
+    challenge_id: int
+    tz: str
+    members_total: int
+    totals: InsightsTotals
+    daily: list[DailyPoint]
+    punchcard: list[list[int]]   # 7 x 24 (0 = segunda), hora local
+    periods: Periods
+    duration_by_weekday: list[WeekdayDuration]
+    streaks: list[Streak]
+    awards: Awards
+    top_workouts: list[TopWorkout]
+    emojis: list[EmojiCount]
+
+
 # ---------- shaping ----------
 def shape_challenge(row) -> Challenge:
     r = _raw(row)
@@ -393,17 +469,25 @@ def workout_comments(wid: int):
     return [shape_comment(c) for c in _fetch_comments(wid)]
 
 
-def local_day(occurred_on: Optional[str]) -> Optional[str]:
-    """Dia de calendario (YYYY-MM-DD) do instante no fuso GYMRATS_TZ."""
+def local_dt(occurred_on: Optional[str]) -> Optional[datetime]:
+    """Instante convertido p/ o fuso GYMRATS_TZ (None se vazio/invalido)."""
     if not occurred_on:
         return None
     try:
         dt = datetime.fromisoformat(occurred_on.replace("Z", "+00:00"))
     except ValueError:
-        return occurred_on[:10] or None
+        return None
     if dt.tzinfo is None:  # sem fuso: trata como UTC, igual ao resto da API
         dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-    return dt.astimezone(TZ).date().isoformat()
+    return dt.astimezone(TZ)
+
+
+def local_day(occurred_on: Optional[str]) -> Optional[str]:
+    """Dia de calendario (YYYY-MM-DD) do instante no fuso GYMRATS_TZ."""
+    dt = local_dt(occurred_on)
+    if dt is None:
+        return (occurred_on or "")[:10] or None
+    return dt.date().isoformat()
 
 
 @app.get("/challenges/{cid}/stats", tags=["workouts"], dependencies=[Depends(require_key)])
@@ -452,6 +536,168 @@ def _raw_from_any(rows, acc_id) -> dict:
         if r["account_id"] == acc_id:
             return (_raw(r).get("account") or {})
     return {}
+
+
+def _now() -> datetime:
+    """'Agora' no fuso local (isolado p/ os testes poderem fixar)."""
+    return datetime.now(TZ)
+
+
+def _period(h: int) -> str:
+    return "madrugada" if h < 5 else "manha" if h < 12 else "tarde" if h < 18 else "noite"
+
+
+def _first_photo(w: dict) -> Optional[str]:
+    """Primeira url de media; senao photo_url."""
+    for m in (w.get("media") or []) if isinstance(w.get("media"), list) else []:
+        u = m.get("url") if isinstance(m, dict) else (m if isinstance(m, str) else None)
+        if u:
+            return u
+    return w.get("photo_url")
+
+
+def _streaks(days: set[date], today: date) -> tuple[int, int]:
+    """(maior sequencia, sequencia atual) de dias consecutivos."""
+    longest = run = 0
+    prev = None
+    for d in sorted(days):
+        run = run + 1 if prev and (d - prev).days == 1 else 1
+        longest = max(longest, run)
+        prev = d
+    cur = 0
+    d = today if today in days else today - timedelta(days=1)
+    while d in days:
+        cur += 1
+        d -= timedelta(days=1)
+    return longest, cur
+
+
+@app.get("/challenges/{cid}/insights", response_model=Insights, tags=["workouts"],
+         dependencies=[Depends(require_key)])
+def challenge_insights(cid: int):
+    """Agregados ricos p/ o dashboard: serie diaria, punchcard, periodos, duracao por dia
+    da semana, sequencias, premios, top check-ins e emojis.
+
+    Tudo calculado no fuso GYMRATS_TZ (default America/Sao_Paulo).
+    """
+    with db() as con:
+        if not con.execute("SELECT 1 FROM challenges WHERE id=?", (cid,)).fetchone():
+            raise HTTPException(404, "desafio nao encontrado")
+        rows = con.execute(
+            "SELECT id,account_id,occurred_on,raw FROM workouts WHERE challenge_id=?", (cid,)).fetchall()
+        members = {m["id"]: _raw(m) for m in
+                   con.execute("SELECT id,raw FROM members WHERE challenge_id=?", (cid,)).fetchall()}
+
+    accounts: dict[int, dict] = {}       # account_id -> raw do account (workout > members)
+    n_workouts: dict[int, int] = {}
+    days_by_acc: dict[int, set[date]] = {}
+    daily: dict[str, list] = {}          # dia -> [workouts, set(atletas), minutos]
+    punch = [[0] * 24 for _ in range(7)]
+    periods = Periods()
+    wd_count, wd_dur = [0] * 7, [[0.0, 0] for _ in range(7)]
+    early: dict[int, int] = {}
+    night: dict[int, int] = {}
+    reacts_recv: dict[int, int] = {}
+    comments_recv: dict[int, int] = {}
+    reacts_given: dict[int, int] = {}
+    reactor_acc: dict[int, dict] = {}
+    emojis: dict[str, int] = {}
+    tops: list[tuple] = []
+    minutes_total = 0.0
+
+    for r in rows:
+        w = _raw(r)
+        aid = r["account_id"]
+        acc = w.get("account") or {}
+        if aid not in accounts or (acc.get("full_name") and not accounts[aid].get("full_name")):
+            accounts[aid] = acc if acc.get("full_name") else (members.get(aid) or acc or {"id": aid})
+        n_workouts[aid] = n_workouts.get(aid, 0) + 1
+        dur = num(w.get("duration"))
+        minutes_total += dur
+        reactions = [x for x in (w.get("reactions") or []) if isinstance(x, dict)]
+        cc = inum(w.get("comment_count")) or 0
+        reacts_recv[aid] = reacts_recv.get(aid, 0) + len(reactions)
+        comments_recv[aid] = comments_recv.get(aid, 0) + cc
+        for x in reactions:
+            if x.get("reaction"):
+                emojis[x["reaction"]] = emojis.get(x["reaction"], 0) + 1
+            ra = x.get("account") or {}
+            if ra.get("id") is not None:
+                rid = inum(ra["id"])
+                reacts_given[rid] = reacts_given.get(rid, 0) + 1
+                reactor_acc.setdefault(rid, ra)
+        if len(reactions) + cc > 0:
+            tops.append((len(reactions) + cc, r["occurred_on"] or "", r, w, len(reactions), cc))
+
+        dt = local_dt(r["occurred_on"])
+        if dt is None:
+            continue
+        day, wd, h = dt.date(), dt.weekday(), dt.hour
+        dd = daily.setdefault(day.isoformat(), [0, set(), 0.0])
+        dd[0] += 1; dd[1].add(aid); dd[2] += dur
+        days_by_acc.setdefault(aid, set()).add(day)
+        punch[wd][h] += 1
+        setattr(periods, _period(h), getattr(periods, _period(h)) + 1)
+        wd_count[wd] += 1
+        if dur > 0:
+            wd_dur[wd][0] += dur; wd_dur[wd][1] += 1
+        if h < 7:
+            early[aid] = early.get(aid, 0) + 1
+        if h >= 21:
+            night[aid] = night.get(aid, 0) + 1
+
+    def acc_of(aid: int) -> Account:
+        a = shape_account(accounts.get(aid) or members.get(aid) or reactor_acc.get(aid) or {})
+        if a.id is None:
+            a.id = aid
+        return a
+
+    def name_of(aid: int) -> str:
+        return (acc_of(aid).full_name or "").lower()
+
+    def award(counts: dict[int, int]) -> Optional[Award]:
+        cands = [(v, a) for a, v in counts.items() if v > 0]
+        if not cands:
+            return None
+        v, a = min(cands, key=lambda t: (-t[0], -n_workouts.get(t[1], 0), name_of(t[1])))
+        return Award(account=acc_of(a), value=v)
+
+    # reacoes dadas: so quem e membro do desafio ou aparece nos check-ins
+    reacts_given = {a: v for a, v in reacts_given.items() if a in members or a in accounts}
+
+    today = _now().astimezone(TZ).date()
+    streaks = []
+    for aid, days in days_by_acc.items():
+        lg, cur = _streaks(days, today)
+        streaks.append(Streak(account=acc_of(aid), longest=lg, current=cur))
+    streaks.sort(key=lambda s: (-s.longest, -s.current, (s.account.full_name or "").lower()))
+
+    tops.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    top_workouts = [TopWorkout(
+        id=r["id"], title=w.get("title"), photo_url=_first_photo(w),
+        account=shape_account(w.get("account") or {}) if (w.get("account") or {}).get("full_name")
+        else acc_of(r["account_id"]),
+        occurred_at=w.get("occurred_at") or r["occurred_on"],
+        reactions_count=nr, comment_count=cc) for _, _, r, w, nr, cc in tops[:3]]
+
+    return Insights(
+        challenge_id=cid, tz=str(TZ.key), members_total=len(members),
+        totals=InsightsTotals(workouts=len(rows), minutes=minutes_total,
+                              athletes_active=len(n_workouts)),
+        daily=[DailyPoint(date=d, workouts=v[0], athletes=len(v[1]), minutes=v[2])
+               for d, v in sorted(daily.items())],
+        punchcard=punch, periods=periods,
+        duration_by_weekday=[WeekdayDuration(
+            weekday=i, workouts=wd_count[i],
+            avg_minutes=(wd_dur[i][0] / wd_dur[i][1]) if wd_dur[i][1] else None) for i in range(7)],
+        streaks=streaks[:5],
+        awards=Awards(early_bird=award(early), night_owl=award(night),
+                      most_reactions=award(reacts_recv), most_comments=award(comments_recv),
+                      most_reactions_given=award(reacts_given)),
+        top_workouts=top_workouts,
+        emojis=[EmojiCount(emoji=e, count=c)
+                for e, c in sorted(emojis.items(), key=lambda t: (-t[1], t[0]))[:8]],
+    )
 
 
 @app.get("/meta/sync", tags=["meta"], dependencies=[Depends(require_key)])

@@ -106,6 +106,7 @@ mv data/backup.db ~/gymrats-$(date +%F).db
 | GET | `/workouts/{id}` | um check-in (reações + `comment_count`) |
 | GET | `/workouts/{id}/comments` | comentários do check-in — busca no GymRats sob demanda (cache ~60s); **requer `GYMRATS_TOKEN` na API** |
 | GET | `/challenges/{id}/stats` | agregados p/ dashboard (por dia, por membro) |
+| GET | `/challenges/{id}/insights` | agregados ricos p/ dashboard: série diária, punchcard 7×24, períodos, duração por dia da semana, sequências, prêmios, top check-ins, emojis (fuso `GYMRATS_TZ`) |
 | GET | `/meta/sync` | última sincronização |
 
 > **Reações** já vêm embutidas em cada check-in (campo `reactions`: quem reagiu + emoji).

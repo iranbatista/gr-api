@@ -11,7 +11,7 @@ com um sincronizador que alimenta um SQLite e um dashboard local.
 | Arquivo | O que é |
 |---|---|
 | `sync.py` | Ingestão: puxa desafios, membros, rankings e check-ins do GymRats → `gymrats.db` (SQLite). Read-only, 1 req/s, incremental. |
-| `api.py` | **REST API** (FastAPI) que serve o SQLite. CORS, API key, paginação, filtros, `/stats`, Swagger em `/docs`. |
+| `api.py` | **REST API** (FastAPI) que serve o SQLite. CORS, API key, paginação, filtros, `/stats`, `/insights`, Swagger em `/docs`. |
 | `app.py` + `templates/` | Dashboard local (Flask) para visualizar rápido em `127.0.0.1:5000`. |
 | `extract_token.py` | Extrai o JWT do `authentication.preferences_pb` (DataStore do app) para `.token.json`. |
 | `Dockerfile` + `docker-compose.yml` | Deploy na VPS: container da API + container do sync (loop de 60 min), SQLite em `./data`. |
