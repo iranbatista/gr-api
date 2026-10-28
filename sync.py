@@ -252,65 +252,96 @@ def as_list(payload):
 
 
 # --- Sync -------------------------------------------------------------------
+def _full_workouts(api: Api, con, cid, c) -> None:
+    """Carga completa (1a vez): cursor de data recente + varredura por ?page."""
+    cursor = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+    start_date = str(c.get("start_date") or "")[:10]
+    for _ in range(12):
+        batch = as_list(api.get(f"/challenges/{cid}/workouts", {"date": cursor}))
+        if not batch:
+            break
+        for w in batch:
+            upsert_workout(con, cid, w)
+        oldest = min((w.get("occurred_at", "") or "")[:10] for w in batch)
+        if not oldest or (oldest <= cursor and len(batch) < 20):
+            break
+        nxt = oldest if oldest != cursor else (
+            datetime.fromisoformat(oldest).date() - timedelta(days=1)).isoformat()
+        cursor = nxt
+        if start_date and cursor < start_date:
+            break
+    seen_first, page = None, 1
+    while page <= 200:
+        batch = as_list(api.get(f"/challenges/{cid}/workouts", {"page": page}))
+        if not batch:
+            break
+        first_id = _id(batch[0])
+        if first_id == seen_first:
+            break
+        seen_first = first_id
+        for w in batch:
+            upsert_workout(con, cid, w)
+        if len(batch) < 20:
+            break
+        page += 1
+
+
+def _incremental_workouts(api: Api, con, cid, c, known: set, today) -> None:
+    """Incremental: o ?page anda pra tras de forma confiavel (o ?date 'gruda' no topo).
+    1) uma chamada ?date=amanha pega o dia corrente (que o ?page ancora em ontem ignora);
+    2) pagina do mais novo p/ tras e PARA na 1a pagina 100% ja conhecida.
+    Tipicamente 2-4 requests por sync."""
+    # (1) dia de hoje
+    for w in as_list(api.get(f"/challenges/{cid}/workouts",
+                             {"date": (today + timedelta(days=1)).isoformat()})):
+        upsert_workout(con, cid, w)
+    # (2) paginas recentes ate alcancar o historico ja salvo
+    page = 1
+    while page <= 200:
+        batch = as_list(api.get(f"/challenges/{cid}/workouts", {"page": page}))
+        if not batch:
+            break
+        new_in_batch = sum(1 for w in batch if _id(w) not in known)
+        for w in batch:
+            upsert_workout(con, cid, w)       # re-upsert tambem atualiza reacoes/contagens
+        if new_in_batch == 0:                 # pagina inteira ja conhecida -> alcancamos
+            break
+        if len(batch) < 20:
+            break
+        page += 1
+
+
 def sync(api: Api):
     con = db()
+    today = datetime.now(timezone.utc).date()
     challenges = as_list(api.get("/challenges/"))
     log(f"{len(challenges)} desafio(s)/clube(s) encontrados.")
     for c in challenges:
         cid = _id(c)
-        # o item da lista ja traz name, rules, score_by, datas — nao busca detalhe
-        # (GET /challenges/:id retorna outra entidade e apagava o nome).
+        # o item da lista ja traz name, rules, score_by, datas — nao busca detalhe.
         upsert_challenge(con, c)
 
+        known = {r[0] for r in con.execute(
+            "SELECT id FROM workouts WHERE challenge_id=?", (cid,)).fetchall()}
+        end = str(c.get("end_date") or "")[:10]
+        ended = bool(end) and end < today.isoformat()
+
+        # Encerrado e ja sincronizado = dados congelados -> pula (economia de requests).
+        if ended and known:
+            log(f"  desafio {cid} '{c.get('name')}': encerrado/ja sincronizado — pulado.")
+            continue
+
+        # membros e ranking (mudam em desafio ativo; baratos — 2 requests)
         for m in as_list(api.get(f"/challenges/{cid}/members")):
             upsert_member(con, cid, m)
-
         for r in as_list(api.get(f"/challenges/{cid}/rankings")):
             upsert_ranking(con, cid, r)
 
-        # check-ins (workouts) — GET /challenges/:id/workouts
-        # A API tem DUAS facetas (mutuamente exclusivas):
-        #  - ?page=N : pagina o historico, mas ancora no "hoje" do servidor (= ontem p/ nos),
-        #              entao NAO inclui o dia corrente.
-        #  - ?date=X : devolve os 20 mais novos <= dia X (cursor por dia), inclui o dia corrente.
-        # Estrategia: cursor por data a partir de amanha p/ pegar os dias recentes,
-        # depois paginacao por ?page p/ varrer todo o historico. UPSERT deduplica.
-        before = len(con.execute(
-            "SELECT 1 FROM workouts WHERE challenge_id=?", (cid,)).fetchall())
-
-        # (A) dias recentes via cursor de data (pega o dia de hoje que o ?page ignora)
-        cursor = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
-        for _ in range(8):
-            batch = as_list(api.get(f"/challenges/{cid}/workouts", {"date": cursor}))
-            if not batch:
-                break
-            for w in batch:
-                upsert_workout(con, cid, w)
-            oldest = min((w.get("occurred_at", "") or "")[:10] for w in batch)
-            if not oldest or oldest <= cursor and len(batch) < 20:
-                break
-            nxt = oldest
-            if nxt == cursor:            # dia cheio (>20): recua 1 dia p/ nao travar
-                nxt = (datetime.fromisoformat(oldest).date() - timedelta(days=1)).isoformat()
-            cursor = nxt
-            if cursor < str(c.get("start_date", ""))[:10]:
-                break
-
-        # (B) historico completo via ?page
-        seen_first, page = None, 1
-        while page <= 200:
-            batch = as_list(api.get(f"/challenges/{cid}/workouts", {"page": page}))
-            if not batch:
-                break
-            first_id = _id(batch[0])
-            if first_id == seen_first:
-                break
-            seen_first = first_id
-            for w in batch:
-                upsert_workout(con, cid, w)
-            if len(batch) < 20:
-                break
-            page += 1
+        before = len(known)
+        if known:
+            _incremental_workouts(api, con, cid, c, known, today)
+        else:
+            _full_workouts(api, con, cid, c)   # 1a vez
 
         con.commit()
         total = len(con.execute(
