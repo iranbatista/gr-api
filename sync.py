@@ -182,6 +182,8 @@ CREATE TABLE IF NOT EXISTS rankings (
   raw JSON, synced_at TEXT, PRIMARY KEY (challenge_id, account_id));
 CREATE TABLE IF NOT EXISTS sync_state (
   challenge_id INTEGER PRIMARY KEY, last_date TEXT);
+CREATE TABLE IF NOT EXISTS sync_meta (
+  challenge_id INTEGER PRIMARY KEY, last_full TEXT);
 """
 
 
@@ -252,8 +254,34 @@ def as_list(payload):
 
 
 # --- Sync -------------------------------------------------------------------
+# A lista de workouts e ordenada por occurred_at, e o app permite backdatar
+# (strict_mode off) ate ~2 semanas. Entao um check-in retroativo entra no MEIO da
+# lista e o incremental (que para no topo ja conhecido) nao o alcanca. Solucao:
+# reconciliacao completa periodica do desafio ativo, que pega qualquer retroativo.
+FULL_INTERVAL_H = float(os.environ.get("GYMRATS_FULL_INTERVAL_HOURS", "6"))
+# Carrega (nao pula) desafios ate GRACE_DAYS apos o fim, p/ pegar backdates finais.
+GRACE_DAYS = int(os.environ.get("GYMRATS_ENDED_GRACE_DAYS", "3"))
+
+
+def _get_last_full(con, cid) -> Optional[datetime]:
+    row = con.execute("SELECT last_full FROM sync_meta WHERE challenge_id=?", (cid,)).fetchone()
+    if row and row[0]:
+        try:
+            return datetime.fromisoformat(row[0])
+        except ValueError:
+            return None
+    return None
+
+
+def _set_last_full(con, cid, when: datetime) -> None:
+    con.execute(
+        "INSERT INTO sync_meta(challenge_id,last_full) VALUES(?,?) "
+        "ON CONFLICT(challenge_id) DO UPDATE SET last_full=excluded.last_full",
+        (cid, when.isoformat()))
+
+
 def _full_workouts(api: Api, con, cid, c) -> None:
-    """Carga completa (1a vez): cursor de data recente + varredura por ?page."""
+    """Carga completa: cursor de data recente + varredura por ?page (pega retroativos)."""
     cursor = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
     start_date = str(c.get("start_date") or "")[:10]
     for _ in range(12):
@@ -311,9 +339,10 @@ def _incremental_workouts(api: Api, con, cid, c, known: set, today) -> None:
         page += 1
 
 
-def sync(api: Api):
+def sync(api: Api, force_full: bool = False):
     con = db()
-    today = datetime.now(timezone.utc).date()
+    now = datetime.now(timezone.utc)
+    today = now.date()
     challenges = as_list(api.get("/challenges/"))
     log(f"{len(challenges)} desafio(s)/clube(s) encontrados.")
     for c in challenges:
@@ -324,29 +353,38 @@ def sync(api: Api):
         known = {r[0] for r in con.execute(
             "SELECT id FROM workouts WHERE challenge_id=?", (cid,)).fetchall()}
         end = str(c.get("end_date") or "")[:10]
-        ended = bool(end) and end < today.isoformat()
+        # So congela depois de GRACE_DAYS alem do fim (pega backdates finais).
+        frozen = bool(end) and end < (today - timedelta(days=GRACE_DAYS)).isoformat()
 
-        # Encerrado e ja sincronizado = dados congelados -> pula (economia de requests).
-        if ended and known:
+        if frozen and known and not force_full:
             log(f"  desafio {cid} '{c.get('name')}': encerrado/ja sincronizado — pulado.")
             continue
 
-        # membros e ranking (mudam em desafio ativo; baratos — 2 requests)
+        # membros e ranking (baratos — 2 requests)
         for m in as_list(api.get(f"/challenges/{cid}/members")):
             upsert_member(con, cid, m)
         for r in as_list(api.get(f"/challenges/{cid}/rankings")):
             upsert_ranking(con, cid, r)
 
         before = len(known)
-        if known:
-            _incremental_workouts(api, con, cid, c, known, today)
+        last_full = _get_last_full(con, cid)
+        due_full = (last_full is None
+                    or (now - last_full) >= timedelta(hours=FULL_INTERVAL_H))
+        if force_full or not known or due_full:
+            # Reconciliacao completa: pega check-ins retroativos (lista e por occurred_at).
+            _full_workouts(api, con, cid, c)
+            _set_last_full(con, cid, now)
+            mode = "completo"
         else:
-            _full_workouts(api, con, cid, c)   # 1a vez
+            # Barato: topo + paginas ate alcancar o conhecido.
+            _incremental_workouts(api, con, cid, c, known, today)
+            mode = "incremental"
 
         con.commit()
         total = len(con.execute(
             "SELECT 1 FROM workouts WHERE challenge_id=?", (cid,)).fetchall())
-        log(f"  desafio {cid} '{c.get('name')}': {total} check-in(s) (+{total-before} novos).")
+        log(f"  desafio {cid} '{c.get('name')}': {total} check-in(s) "
+            f"(+{total-before} novos) [{mode}].")
     con.close()
     log(f"Pronto. Banco: {DB_PATH}")
 
@@ -378,13 +416,15 @@ def dump(api: Api):
 def main():
     ap = argparse.ArgumentParser(description="GymRats -> SQLite (read-only).")
     ap.add_argument("--dump", action="store_true", help="salva JSON cru p/ inspeção")
+    ap.add_argument("--full", action="store_true",
+                    help="forca reconciliacao completa de todos os desafios (incl. encerrados)")
     args = ap.parse_args()
     api = Api()
     log(f"Base: {BASE_URL} | token em cache: {mask(api.token)}")
     if args.dump:
         dump(api)
     else:
-        sync(api)
+        sync(api, force_full=args.full)
 
 
 if __name__ == "__main__":
