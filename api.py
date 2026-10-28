@@ -313,6 +313,7 @@ class Insights(BaseModel):
     awards: Awards
     top_workouts: list[TopWorkout]
     emojis: list[EmojiCount]
+    until: Optional[str] = None  # corte (YYYY-MM-DD) ou null
 
 
 # ---------- shaping ----------
@@ -624,16 +625,18 @@ def local_day(occurred_on: Optional[str]) -> Optional[str]:
 
 
 @app.get("/challenges/{cid}/stats", tags=["workouts"], dependencies=[Depends(require_key)])
-def challenge_stats(cid: int):
+def challenge_stats(cid: int, until: Optional[date] = None):
     """Agregados prontos para dashboard: total, check-ins por dia e por membro.
 
     Dias sao contados no fuso GYMRATS_TZ (default America/Sao_Paulo).
+    `until` (YYYY-MM-DD): so check-ins com dia local <= until.
     """
     with db() as con:
         rows = con.execute(
             "SELECT account_id,occurred_on,raw FROM workouts WHERE challenge_id=?", (cid,)).fetchall()
         members = {m["id"]: _raw(m) for m in
                    con.execute("SELECT id,raw FROM members WHERE challenge_id=?", (cid,)).fetchall()}
+    rows = _until_rows(rows, until)
     by_day: dict[str, int] = {}
     by_member: dict[int, dict] = {}
     member_days: dict[int, set[str]] = {}
@@ -657,11 +660,21 @@ def challenge_stats(cid: int):
         m["name"] = (info or {}).get("full_name")
     return {
         "challenge_id": cid,
+        "until": until.isoformat() if until else None,
         "total_workouts": len(rows),
         "members": len(by_member),
         "by_day": [{"date": d, "count": by_day[d]} for d in sorted(by_day)],
         "by_member": sorted(by_member.values(), key=lambda x: x["workouts"], reverse=True),
     }
+
+
+def _until_rows(rows, until: Optional[date]):
+    """Corte por dia local <= until; sem data parseavel fica de fora quando ha corte."""
+    if until is None:
+        return rows
+    lim = until.isoformat()
+    return [r for r in rows if local_dt(r["occurred_on"]) is not None
+            and local_day(r["occurred_on"]) <= lim]
 
 
 def _raw_from_any(rows, acc_id) -> dict:
@@ -707,11 +720,12 @@ def _streaks(days: set[date], today: date) -> tuple[int, int]:
 
 @app.get("/challenges/{cid}/insights", response_model=Insights, tags=["workouts"],
          dependencies=[Depends(require_key)])
-def challenge_insights(cid: int):
+def challenge_insights(cid: int, until: Optional[date] = None):
     """Agregados ricos p/ o dashboard: serie diaria, punchcard, periodos, duracao por dia
     da semana, sequencias, premios, top check-ins e emojis.
 
     Tudo calculado no fuso GYMRATS_TZ (default America/Sao_Paulo).
+    `until` (YYYY-MM-DD): so check-ins com dia local <= until; "hoje" das sequencias vira until.
     """
     with db() as con:
         if not con.execute("SELECT 1 FROM challenges WHERE id=?", (cid,)).fetchone():
@@ -720,6 +734,7 @@ def challenge_insights(cid: int):
             "SELECT id,account_id,occurred_on,raw FROM workouts WHERE challenge_id=?", (cid,)).fetchall()
         members = {m["id"]: _raw(m) for m in
                    con.execute("SELECT id,raw FROM members WHERE challenge_id=?", (cid,)).fetchall()}
+    rows = _until_rows(rows, until)
 
     accounts: dict[int, dict] = {}       # account_id -> raw do account (workout > members)
     n_workouts: dict[int, int] = {}
@@ -821,7 +836,7 @@ def challenge_insights(cid: int):
         _, x, y, ab, ba = best
         return DuoAward(accounts=[acc_of(x), acc_of(y)], value=ab + ba, a_to_b=ab, b_to_a=ba)
 
-    today = _now().astimezone(TZ).date()
+    today = until or _now().astimezone(TZ).date()
     streaks = []
     for aid, days in days_by_acc.items():
         lg, cur = _streaks(days, today)
@@ -838,6 +853,7 @@ def challenge_insights(cid: int):
 
     return Insights(
         challenge_id=cid, tz=str(TZ.key), members_total=len(members),
+        until=until.isoformat() if until else None,
         totals=InsightsTotals(workouts=len(rows), minutes=minutes_total,
                               athletes_active=len(n_workouts)),
         daily=[DailyPoint(date=d, workouts=v[0], athletes=len(v[1]), minutes=v[2])

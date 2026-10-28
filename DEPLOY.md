@@ -105,8 +105,8 @@ mv data/backup.db ~/gymrats-$(date +%F).db
 | GET | `/challenges/{id}/workouts` | check-ins (com reações embutidas) — `?limit=&offset=&member_id=&since=&until=` |
 | GET | `/workouts/{id}` | um check-in (reações + `comment_count`) |
 | GET | `/workouts/{id}/comments` | comentários do check-in — busca no GymRats sob demanda (cache ~60s); **requer `GYMRATS_TOKEN` na API** |
-| GET | `/challenges/{id}/stats` | agregados p/ dashboard (por dia, por membro) |
-| GET | `/challenges/{id}/insights` | agregados ricos p/ dashboard: série diária, punchcard 7×24, períodos, duração por dia da semana, sequências, prêmios, top check-ins, emojis (fuso `GYMRATS_TZ`) |
+| GET | `/challenges/{id}/stats` | agregados p/ dashboard (por dia, por membro) — `?until=YYYY-MM-DD` corta por dia local |
+| GET | `/challenges/{id}/insights` | agregados ricos p/ dashboard: série diária, punchcard 7×24, períodos, duração por dia da semana, sequências, prêmios, top check-ins, emojis (fuso `GYMRATS_TZ`) — `?until=YYYY-MM-DD` corta por dia local |
 | GET | `/meta/sync` | última sincronização |
 | GET | `/img?u=<url>&w=<64\|128\|256\|512\|1024>` | miniatura WebP de uma imagem do CDN (público; só `https://cdn.gymrats.app/...` e larguras da lista, senão 400). Gerada uma vez e cacheada em `data/thumbs` (`Cache-Control: immutable` + `ETag`/304). Limpar o cache: `rm -rf data/thumbs` |
 
