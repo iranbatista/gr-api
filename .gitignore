@@ -10,3 +10,5 @@ emu_*.png
 data/
 .pytest_cache/
 .thumbs/
+secrets/
+*.gsa.json

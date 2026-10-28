@@ -37,6 +37,8 @@ try:
 except ImportError:
     keyring = None
 
+import sheets  # exportador opcional p/ Google Sheets (no-op se nao configurado)
+
 # --- Config -----------------------------------------------------------------
 # Base real (produção), confirmada ao vivo: a API fica em www.gymrats.app sob /api.
 BASE_URL = os.environ.get("GYMRATS_BASE_URL", "https://www.gymrats.app/api")
@@ -385,6 +387,8 @@ def sync(api: Api, force_full: bool = False):
             "SELECT 1 FROM workouts WHERE challenge_id=?", (cid,)).fetchall())
         log(f"  desafio {cid} '{c.get('name')}': {total} check-in(s) "
             f"(+{total-before} novos) [{mode}].")
+        # Espelha os check-ins do desafio ativo numa planilha (se configurado).
+        sheets.export_checkins(con, c, log=log)
     con.close()
     log(f"Pronto. Banco: {DB_PATH}")
 

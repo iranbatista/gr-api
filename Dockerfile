@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt requirements-api.txt ./
 RUN pip install -r requirements.txt -r requirements-api.txt
 
-COPY api.py sync.py ./
+COPY api.py sync.py sheets.py ./
 
 # Sem root. O host precisa dar a pasta data/ para o uid 1000 (ver DEPLOY.md).
 RUN useradd --system --uid 1000 gymrats && mkdir -p /data && chown gymrats /data

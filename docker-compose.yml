@@ -40,6 +40,15 @@ services:
     environment:
       GYMRATS_TOKEN: ${GYMRATS_TOKEN:?defina GYMRATS_TOKEN no .env}
       GYMRATS_BASE_URL: ${GYMRATS_BASE_URL:-https://www.gymrats.app/api}
+      # Export opcional p/ Google Sheets. Vazio = desligado (sync roda igual).
+      GYMRATS_SHEETS_ID: ${GYMRATS_SHEETS_ID:-}
+      # Caminho do JSON da service account DENTRO do container (ver volume abaixo).
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+    volumes:
+      # Herda o ./data do &app e monta a chave da service account (read-only).
+      # Crie ./secrets/gsa.json no host; se nao usar Sheets, pode remover estas 2 linhas.
+      - ./data:/data
+      - ./secrets:/secrets:ro
     # Sem HTTP: o healthcheck da imagem (request na API) não se aplica aqui.
     healthcheck:
       disable: true
