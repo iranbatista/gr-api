@@ -49,6 +49,18 @@ COLUMNS = [
 # Caracteres proibidos em nome de aba do Sheets.
 _BAD_TAB = set(':\\/?*[]')
 
+# --- Estilo da aba ----------------------------------------------------------
+_HEADER_BG = {"red": 0.20, "green": 0.29, "blue": 0.37}   # azul-ardosia escuro
+_BAND_1 = {"red": 1, "green": 1, "blue": 1}               # linha clara
+_BAND_2 = {"red": 0.95, "green": 0.96, "blue": 0.97}      # linha alternada (cinza claro)
+_INT_COLS = {"duration", "calories", "points", "reactions", "comments"}
+_DEC_COLS = {"distance"}
+_COL_WIDTH = {
+    "date": 90, "time": 60, "member": 160, "activity": 230, "duration": 95,
+    "distance": 90, "calories": 85, "points": 70, "description": 280,
+    "reactions": 80, "comments": 105, "id": 110,
+}
+
 
 def _enabled() -> tuple[str, str] | None:
     sid = os.environ.get("GYMRATS_SHEETS_ID")
@@ -191,6 +203,67 @@ def _build_values(con, cid: int, score_by: str | None = None) -> list[list]:
     return out
 
 
+def _format_sheet(sh, ws, n_rows: int) -> None:
+    """Aplica cabecalho estilizado, zebra, filtro, formato de numero e larguras.
+    Uma unica chamada batch_update. Idempotente (recria a zebra a cada run)."""
+    sid = ws.id
+    n_cols = len(COLUMNS)
+    reqs: list = []
+
+    # cabecalho congelado
+    reqs.append({"updateSheetProperties": {
+        "properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 1}},
+        "fields": "gridProperties.frozenRowCount"}})
+
+    # zebra: remove faixas anteriores (senao addBanding colide) e recria
+    try:
+        meta = sh.fetch_sheet_metadata()
+        for s in meta.get("sheets", []):
+            if s.get("properties", {}).get("sheetId") == sid:
+                for b in s.get("bandedRanges", []) or []:
+                    reqs.append({"deleteBanding": {"bandedRangeId": b["bandedRangeId"]}})
+    except Exception:  # noqa: BLE001
+        pass
+    reqs.append({"addBanding": {"bandedRange": {
+        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": n_rows,
+                  "startColumnIndex": 0, "endColumnIndex": n_cols},
+        "rowProperties": {"headerColor": _HEADER_BG,
+                          "firstBandColor": _BAND_1, "secondBandColor": _BAND_2}}}})
+
+    # cabecalho: negrito, branco, centralizado
+    reqs.append({"repeatCell": {
+        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+                  "startColumnIndex": 0, "endColumnIndex": n_cols},
+        "cell": {"userEnteredFormat": {
+            "backgroundColor": _HEADER_BG,
+            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+            "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                           "bold": True, "fontSize": 10}}},
+        "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"}})
+
+    # formato de numero (so se houver linhas de dados) + larguras
+    for i, (key, _) in enumerate(COLUMNS):
+        if n_rows > 1 and (key in _INT_COLS or key in _DEC_COLS):
+            pattern = "0" if key in _INT_COLS else "0.00"
+            reqs.append({"repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n_rows,
+                          "startColumnIndex": i, "endColumnIndex": i + 1},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": pattern}}},
+                "fields": "userEnteredFormat.numberFormat"}})
+        w = _COL_WIDTH.get(key)
+        if w:
+            reqs.append({"updateDimensionProperties": {
+                "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": i, "endIndex": i + 1},
+                "properties": {"pixelSize": w}, "fields": "pixelSize"}})
+
+    # filtro na faixa toda (substitui filtro anterior, se houver)
+    reqs.append({"setBasicFilter": {"filter": {
+        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": n_rows,
+                  "startColumnIndex": 0, "endColumnIndex": n_cols}}}})
+
+    sh.batch_update({"requests": reqs})
+
+
 def export_checkins(con, c: dict, log=print) -> None:
     """Se configurado e o desafio estiver ativo, reescreve a aba de check-ins.
 
@@ -221,8 +294,12 @@ def export_checkins(con, c: dict, log=print) -> None:
                                   cols=len(COLUMNS))
         ws.clear()
         ws.update(range_name="A1", values=values, value_input_option="RAW")
-        # metadados discretos numa celula ao lado do cabecalho? nao: mantemos simples.
         log(f"  [sheets] aba '{title}': {len(values) - 1} check-in(s) exportados.")
+        # formatacao (nao critica: se falhar, os dados ja estao escritos)
+        try:
+            _format_sheet(sh, ws, len(values))
+        except Exception as e:  # noqa: BLE001
+            log(f"  [sheets] dados ok, mas a formatacao falhou: {str(e) or type(e).__name__}")
     except Exception as e:  # noqa: BLE001 — isolar o sync de qualquer falha do Sheets
         # gspread 6.x as vezes embrulha o 403 num PermissionError com str() vazio;
         # mostramos tipo + corpo HTTP quando houver, p/ a causa nunca sumir no log.
