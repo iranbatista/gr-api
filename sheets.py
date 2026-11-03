@@ -23,7 +23,12 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # py<3.9
+    ZoneInfo = None
 
 # Colunas da planilha, na ordem. (chave interna, cabecalho)
 COLUMNS = [
@@ -78,21 +83,72 @@ def _num(v):
         return v
 
 
-def _split_dt(iso: str | None) -> tuple[str, str]:
-    """ISO 'YYYY-MM-DDTHH:MM:SS…' -> ('YYYY-MM-DD', 'HH:MM'). Tolerante a formatos."""
-    if not iso:
-        return "", ""
-    s = str(iso)
-    d = s[:10]
-    t = ""
-    if "T" in s and len(s) >= 16:
-        t = s[11:16]
-    return d, t
+def _parse_tz(tz):
+    """tz do check-in -> tzinfo. Aceita IANA ('America/Sao_Paulo') ou offset ('-03:00')."""
+    if not tz:
+        return None
+    tz = str(tz).strip()
+    if tz and tz[0] in "+-" and ":" in tz:        # offset fixo, ex. -03:00
+        try:
+            sign = -1 if tz[0] == "-" else 1
+            hh, mm = tz[1:].split(":")
+            return timezone(sign * timedelta(hours=int(hh), minutes=int(mm)))
+        except ValueError:
+            return None
+    if ZoneInfo:                                   # nome IANA (precisa tzdata)
+        try:
+            return ZoneInfo(tz)
+        except Exception:  # noqa: BLE001 — ZoneInfoNotFoundError etc.
+            return None
+    return None
 
 
-def _row(raw: dict, member_name: str) -> list:
+def _local_dt(raw: dict):
+    """occurred_at (UTC) convertido pro fuso do proprio check-in (campo 'tz')."""
     occ = raw.get("occurred_at") or raw.get("created_at")
-    d, t = _split_dt(occ)
+    if not occ:
+        return None
+    s = str(occ).replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    tzinfo = _parse_tz(raw.get("tz"))
+    if tzinfo is not None:
+        try:
+            dt = dt.astimezone(tzinfo)
+        except Exception:  # noqa: BLE001
+            pass
+    return dt
+
+
+def _workout_points(raw: dict, score_by: str | None, seen_days: set, ldt):
+    """Pontos por check-in DERIVADOS da regra do desafio (a API nao manda 'points').
+    - workouts: 1 por check-in
+    - duration: a duracao (min) do check-in
+    - days:     1 no 1o check-in do dia (fuso local) por pessoa; 0 nos demais
+    - outro/desconhecido: em branco
+    """
+    if score_by == "workouts":
+        return 1
+    if score_by == "duration":
+        return _num(raw.get("duration"))
+    if score_by == "days":
+        acc = (raw.get("account") or {}).get("id") or raw.get("gym_rats_user_id")
+        day = ldt.date().isoformat() if ldt else str(raw.get("occurred_at") or "")[:10]
+        key = (acc, day)
+        if key in seen_days:
+            return 0
+        seen_days.add(key)
+        return 1
+    return ""
+
+
+def _row(raw: dict, member_name: str, points, ldt) -> list:
+    d = ldt.date().isoformat() if ldt else ""
+    t = ldt.strftime("%H:%M") if ldt else ""
     acc = raw.get("account") or {}
     name = acc.get("full_name") or member_name or ""
     reactions = raw.get("reactions")
@@ -101,12 +157,13 @@ def _row(raw: dict, member_name: str) -> list:
         "date": d,
         "time": t,
         "member": name,
-        "activity": raw.get("activity_type") or raw.get("activity") or "",
+        # 'activity_type' vem vazio da API; a atividade real e o titulo digitado.
+        "activity": (raw.get("title") or raw.get("activity_type") or "").replace("\n", " ").strip(),
         "duration": _num(raw.get("duration")),
         "distance": _num(raw.get("distance")),
         "calories": _num(raw.get("calories")),
-        "points": _num(raw.get("points")),
-        "description": (raw.get("description") or raw.get("title") or "").replace("\n", " ").strip(),
+        "points": points,
+        "description": (raw.get("description") or "").replace("\n", " ").strip(),
         "reactions": n_react,
         "comments": _num(raw.get("comment_count")) or 0,
         "id": raw.get("id"),
@@ -114,7 +171,7 @@ def _row(raw: dict, member_name: str) -> list:
     return [values[k] for k, _ in COLUMNS]
 
 
-def _build_values(con, cid: int) -> list[list]:
+def _build_values(con, cid: int, score_by: str | None = None) -> list[list]:
     """Cabecalho + uma linha por check-in, mais novos no topo (occurred_on DESC)."""
     names = {r[0]: r[1] for r in con.execute(
         "SELECT id, name FROM members WHERE challenge_id=?", (cid,)).fetchall()}
@@ -122,12 +179,15 @@ def _build_values(con, cid: int) -> list[list]:
         "SELECT account_id, raw FROM workouts WHERE challenge_id=? "
         "ORDER BY occurred_on DESC, id DESC", (cid,)).fetchall()
     out = [[h for _, h in COLUMNS]]
+    seen_days: set = set()   # p/ score_by='days': 1 ponto por (pessoa, dia)
     for account_id, raw_json in rows:
         try:
             raw = json.loads(raw_json)
         except (json.JSONDecodeError, TypeError):
             continue
-        out.append(_row(raw, names.get(account_id, "")))
+        ldt = _local_dt(raw)
+        pts = _workout_points(raw, score_by, seen_days, ldt)
+        out.append(_row(raw, names.get(account_id, ""), pts, ldt))
     return out
 
 
@@ -152,7 +212,7 @@ def export_checkins(con, c: dict, log=print) -> None:
         gc = gspread.service_account(filename=creds_path)
         sh = gc.open_by_key(sheet_id)
         title = _tab_title(c.get("name"))
-        values = _build_values(con, cid)
+        values = _build_values(con, cid, c.get("score_by"))
         try:
             ws = sh.worksheet(title)
         except gspread.exceptions.WorksheetNotFound:
