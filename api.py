@@ -42,7 +42,10 @@ from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel
 
+import apikeys
+
 DB_PATH = os.environ.get("GYMRATS_DB", os.path.join(os.path.dirname(__file__), "gymrats.db"))
+# Chave unica (compat). Em paralelo, o registro multi-key (apikeys.py) tambem vale.
 API_KEY = os.environ.get("GYMRATS_API_KEY", "")
 # Fuso usado para agrupar check-ins por dia (by_day, active_days).
 TZ = ZoneInfo(os.environ.get("GYMRATS_TZ", "America/Sao_Paulo"))
@@ -75,9 +78,43 @@ app.add_middleware(
 
 
 # ---------- infra ----------
+# Cache dos hashes do registro multi-key, invalidado por (mtime_ns, tamanho) do
+# arquivo: nao le o JSON do disco a cada request, mas pega chaves novas/revogadas
+# sem reiniciar. Inclui o tamanho porque dois writes no mesmo instante podem ter o
+# mesmo mtime; add e revoke sempre mudam o tamanho (revoke troca null -> timestamp).
+_keys_cache: dict[str, Any] = {"stamp": object(), "hashes": frozenset()}
+
+
+def _active_key_hashes() -> frozenset:
+    path = apikeys.registry_path()
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    if stamp != _keys_cache["stamp"]:
+        _keys_cache["stamp"] = stamp
+        _keys_cache["hashes"] = frozenset(apikeys.active_hashes(path))
+    return _keys_cache["hashes"]
+
+
 def require_key(x_api_key: Optional[str] = Header(default=None)):
-    if API_KEY and not secrets.compare_digest((x_api_key or "").encode(), API_KEY.encode()):
-        raise HTTPException(status_code=401, detail="X-API-Key ausente ou invalida")
+    """Libera se a chave bate com GYMRATS_API_KEY ou com alguma chave ativa do
+    registro (apikeys.py). Fica aberto SO quando nada esta configurado: sem
+    GYMRATS_API_KEY e sem arquivo de registro. Se o registro existe mas nao tem
+    chaves ativas (ex.: a ultima foi revogada), a API trava (fail-closed) — revogar
+    a ultima chave nunca torna a API publica."""
+    reg_hashes = _active_key_hashes()
+    reg_exists = _keys_cache["stamp"] is not None  # _active_key_hashes acabou de fazer o stat
+    if not API_KEY and not reg_exists:
+        return  # nada configurado -> aberto (mesmo comportamento de antes)
+    presented = x_api_key or ""
+    if presented:
+        if API_KEY and secrets.compare_digest(presented.encode(), API_KEY.encode()):
+            return
+        if hashlib.sha256(presented.encode()).hexdigest() in reg_hashes:
+            return
+    raise HTTPException(status_code=401, detail="X-API-Key ausente ou invalida")
 
 
 @contextmanager

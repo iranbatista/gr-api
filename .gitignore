@@ -13,3 +13,5 @@ data/
 .thumbs/
 secrets/
 *.gsa.json
+apikeys.json
+apikeys.json.tmp
